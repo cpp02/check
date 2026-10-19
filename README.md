@@ -1,39 +1,30 @@
-# Handelsnaam & Domeinchecker — online website
+# Handelsnaam- en domeinchecker — 100% gratis
 
-Dit is een kant-en-klare **Streamlit-website** voor het controleren van tientallen Nederlandse namen tegelijk. De app controleert `.nl`-domeinen bij SIDN RDAP; een KVK-zoekcontrole is optioneel en vereist een eigen KVK API-sleutel. BOIP/merknaamonderzoek blijft handmatig.
+Streamlit-website voor het filteren van maximaal 200 namen per ronde, zonder betaalde API-sleutels.
 
-## Publiceren als online website (zonder eigen server)
+## Online publiceren
 
-1. Maak een (bij voorkeur **privé**) repository op https://github.com/new, bijvoorbeeld `handelsnaamchecker`.
-2. Upload **de bestanden in deze map** naar de hoofdmap van die repository, inclusief `app.py`, `requirements.txt` en `.streamlit/config.toml` (de laatste is verborgen op sommige computers). Upload nooit een bestand `secrets.toml` met een echte sleutel.
-3. Open https://share.streamlit.io/ en meld je aan met GitHub.
-4. Kies **Create app** > **Yup, I have an app** en selecteer de repository, branch `main`, en als main file `app.py`.
-5. Druk op **Deploy**. Je krijgt een eigen URL met `.streamlit.app`. Kies de gewenste zichtbaarheid in de app-instellingen. Controleer de actuele beperkingen van gratis/private apps bij Streamlit.
-6. Optioneel: voeg bij **Advanced settings > Secrets** de KVK API-sleutel toe als:
+1. Pak ZIP uit en upload **de bestanden uit de map** naar een GitHub-repository.
+2. Maak een app via https://share.streamlit.io met `app.py` als entrypoint.
+3. Voer namen in (één per regel) of upload een CSV/TXT. Start de controle.
+4. Export: alle resultaten of alleen kandidaten die niet zijn afgekeurd.
 
-   ```toml
-   KVK_API_KEY = "jouw-echte-sleutel"
-   ```
+Voor lokaal gebruik: `pip install -r requirements.txt` en `streamlit run app.py`.
 
-   Een sleutel kan ook tijdelijk worden ingevuld in de sidebar, maar centraal via Secrets is makkelijker voor meerdere medewerkers.
+## Wat wordt wel automatisch gecontroleerd?
 
-Meer informatie: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy
+- DNS-resolutie, website via HTTPS/HTTP, HTTP-code en doorverwijzingen. Reactie van webserver (behalve 404/410) = afkeuren volgens jouw filter.
+- Optioneel publieke SIDN RDAP; geen account/API-key vereist, maar rate limiting is mogelijk (429). 
+- Bij gevonden SIDN-registratie wordt de naam afgekeurd. Geen registratie gevonden via RDAP betekent **niet** dat registratie is gegarandeerd.
+- Fouten en onbereikbaarheid krijgen een eigen status; worden niet als 'vrij' aangeduid.
 
-## Lokaal testen
+## Wat wordt NIET automatisch gecontroleerd?
 
-Python 3.10 of nieuwer:
+- Handelsregister, KVK, merkenregister of zoekmachinevermeldingen: daar is zonder geschikte toegang geen betrouwbare gratis bulk-API voor. We **scrapen geen websites** en omzeilen geen limieten.
+- In de tabel/CSV staan directe zoeklinks naar Google, Bing, DuckDuckGo, KVK en BOIP om overgebleven kandidaten snel handmatig te toetsen.
 
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
+**Belangrijk:** geen actieve site betekent niet dat het domein of de handelsnaam beschikbaar is. Gebruik voor definitieve selectie officiële controles en een registrar. De app registreert niets.
 
-## Wat deze tool wel en niet doet
+## Technische aandachtspunten
 
-- **Domein**: RDAP-status `200` = geregistreerd; `404` = geen registratie gevonden. Dat laatste is **geen garantie** dat registratie mogelijk is. Controleer bij een registrar voordat je registreert.
-- **Handelsnaam**: via optionele KVK Zoek API toont de tool mogelijke overeenkomsten, geen definitieve juridische vrijgave. Sterk vergelijkbare namen moeten apart worden onderzocht.
-- **Merken**: de officiële KVK/BOIP Naamchecker en BOIP-merkenregister zijn via links te bereiken, maar worden **niet** automatisch uitgelezen.
-- **Privacy**: namen worden bij controles verstuurd naar SIDN (en bij ingeschakelde KVK-check naar KVK). Streamlit Cloud draait de app op externe servers. Zet voor intern gebruik de app privé en deel geen gevoelige sleutels.
-- **Volumes**: maximaal 200 namen per ronde en beperkte gelijktijdigheid om API-limieten te beperken.
-
-Bronnen: https://www.sidn.nl/en/rdap · https://developers.kvk.nl/ · https://www.kvk.nl/starten/naamchecker/
+De HTTP-check blokkeert IP-adressen die niet publiek routeerbaar zijn en controleert opnieuw bij redirects, maar is geen volledig afgeschermde browser. Gebruik bij voorkeur een gescheiden hostingomgeving. De applicatie is syntax-getest, niet live getest vanaf jouw Streamlit-server.

@@ -1,161 +1,184 @@
 import csv
 import io
+import ipaddress
 import re
-import time
+import unicodedata
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus, urljoin, urlsplit
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Handelsnaam & Domeinchecker", page_icon="🔎", layout="wide")
-st.title("🔎 Handelsnaam & Domeinchecker")
-st.markdown("**Controleer tot 200 namen in één keer** en exporteer de uitkomsten naar Excel/CSV.")
-st.caption("Vooronderzoek voor Nederlandse handelsnamen en .nl-domeinen. Resultaten zijn geen juridische vrijgave of registratiegarantie.")
+st.set_page_config(page_title='Handelsnaam & Domeinchecker', page_icon='🔎', layout='wide')
+st.title('🔎 Handelsnaam & Domeinchecker')
+st.write('Controleer tot 200 .nl-namen met **gratis DNS- en websitecheck**, optionele **gratis SIDN RDAP-controle**, openbare zoeklinks en CSV-export. Geen betaalde API nodig.')
+st.caption('Een websitecheck is een goedkope voorselectie, geen bewijs dat een domeinnaam vrij is.')
 
-SIDN_RDAP = "https://rdap.sidn.nl/domain/"
-KVK_URL = "https://api.kvk.nl/api/v2/zoeken"
+SIDN_RDAP = 'https://rdap.sidn.nl/domain/'
+HEADERS = {'User-Agent': 'Handelsnaamchecker/2.0 (website prescreen)', 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}
 
 
-def normaliseer_domein(naam: str) -> str:
-    naam = naam.lower().strip()
-    naam = re.sub(r"^https?://", "", naam)
-    naam = naam.split("/")[0]
-    if naam.endswith(".nl"):
-        naam = naam[:-3]
-    naam = re.sub(r"\s+", "", naam)
+def normaliseer_domein(naam):
+    value = naam.lower().strip()
+    value = re.sub(r'^https?://', '', value)
+    value = value.split('/')[0].split(':')[0].rstrip('.')
+    if value.endswith('.nl'):
+        value = value[:-3]
+    value = re.sub(r'\s+', '', value)
     try:
-        naam = naam.encode("idna").decode("ascii")
+        value = value.encode('idna').decode('ascii')
     except UnicodeError:
-        return ""
-    if len(naam) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", naam):
-        return ""
-    return naam + ".nl"
+        return ''
+    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', value):
+        return ''
+    return value + '.nl'
 
 
-def domein_check(domein: str, timeout=12) -> tuple[str, str]:
+def resolve_public(host):
+    try:
+        addresses = {i[4][0] for i in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+        if not addresses:
+            return [], 'Geen A/AAAA-adres'
+        # Never make server-side HTTP requests to private/loopback/link-local destinations.
+        if any(not ipaddress.ip_address(x).is_global for x in addresses):
+            return sorted(addresses), 'Niet-publiek IP-adres; HTTP-check geblokkeerd'
+        return sorted(addresses), ''
+    except socket.gaierror:
+        return [], 'Geen A/AAAA-adres gevonden'
+    except OSError as e:
+        return [], f'DNS-fout ({type(e).__name__})'
+
+
+def website_check(domein, timeout=4):
     if not domein:
-        return "Ongeldig", "Geen geldige .nl-domeinnaam"
+        return {'Website': 'Ongeldige naam', 'Selectie': 'Afkeuren', 'Eind-URL': '', 'HTTP': '', 'IP-adres(sen)': '', 'Website-opmerking': 'Geen geldige .nl-naam'}
+    ips, reason = resolve_public(domein)
+    base = {'Website': '', 'Selectie': '', 'Eind-URL': '', 'HTTP': '', 'IP-adres(sen)': ', '.join(ips), 'Website-opmerking': reason}
+    if reason:
+        base.update({'Website': 'Niet vastgesteld', 'Selectie': 'Verder controleren'})
+        return base
+    # GET with stream=True: only headers are needed; avoid downloading entire sites.
+    # Resolve and validate every redirect hop; block local-network targets.
+    for scheme in ('https', 'http'):
+        url = f'{scheme}://{domein}/'
+        for _ in range(5):
+            parsed = urlsplit(url)
+            if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+                break
+            _, bad = resolve_public(parsed.hostname)
+            if bad:
+                base['Website-opmerking'] = f'Doorverwijzing niet veilig/controleerbaar: {bad}'
+                break
+            try:
+                with requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=False, stream=True) as r:
+                    status = r.status_code
+                    if 300 <= status < 400 and r.headers.get('Location'):
+                        url = urljoin(url, r.headers['Location'])
+                        continue
+                    base['Eind-URL'] = url
+                    base['HTTP'] = str(status)
+                    if status in (404, 410):
+                        base.update({'Website': 'Geen bruikbare pagina', 'Selectie': 'Verder controleren', 'Website-opmerking': 'Server antwoordt, maar pagina ontbreekt; domein kan geregistreerd zijn'})
+                    else:
+                        base.update({'Website': 'Website / HTTP-reactie gevonden', 'Selectie': 'Afkeuren', 'Website-opmerking': 'Een webserver geeft een HTTP-reactie; niet selecteren volgens de ingestelde filterregel'})
+                    return base
+            except requests.RequestException as e:
+                base['Website-opmerking'] = f'Verbindingsprobleem: {type(e).__name__}'
+                break
+        else:
+            base['Website-opmerking'] = 'Te veel doorverwijzingen'
+    base.update({'Website': 'Geen website bevestigd', 'Selectie': 'Verder controleren'})
+    return base
+
+
+def domein_check(domein, timeout=8):
+    if not domein:
+        return 'Ongeldig', 'Geen geldige .nl-domeinnaam'
     try:
-        res = requests.get(
-            SIDN_RDAP + quote(domein, safe=".-"),
-            headers={"Accept": "application/rdap+json", "User-Agent": "Handelsnaamchecker/1.0"},
-            timeout=timeout,
-        )
-        if res.status_code == 200:
-            return "Geregistreerd", "RDAP-record gevonden"
-        if res.status_code == 404:
-            return "Geen registratie gevonden", "RDAP 404; controleer beschikbaarheid nogmaals bij SIDN/registrar"
-        if res.status_code == 429:
-            return "Onbekend", "Limiet bereikt bij SIDN (HTTP 429)"
-        return "Onbekend", f"SIDN HTTP {res.status_code}"
-    except requests.RequestException as ex:
-        return "Onbekend", f"Verbinding mislukt: {type(ex).__name__}"
+        r = requests.get(SIDN_RDAP + quote(domein, safe='.-'), headers={'Accept': 'application/rdap+json', 'User-Agent': 'Handelsnaamchecker/2.0'}, timeout=timeout)
+        if r.status_code == 200:
+            return 'Geregistreerd', 'SIDN RDAP-record gevonden'
+        if r.status_code == 404:
+            return 'Geen registratie gevonden', 'Bij registrar opnieuw controleren'
+        if r.status_code == 429:
+            return 'Onbekend', 'SIDN-limiet bereikt (429)'
+        return 'Onbekend', f'SIDN HTTP {r.status_code}'
+    except requests.RequestException as e:
+        return 'Onbekend', type(e).__name__
 
 
-def kvk_check(naam: str, api_key: str, timeout=12) -> tuple[str, str]:
-    if not api_key:
-        return "Niet gecontroleerd", "KVK API-sleutel ontbreekt"
-    try:
-        res = requests.get(
-            KVK_URL,
-            params={"naam": naam, "pagina": 1},
-            headers={"apikey": api_key, "Accept": "application/json"},
-            timeout=timeout,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            items = data.get("resultaten", [])
-            matches = [str(x.get("naam", "")) for x in items if x.get("naam")]
-            if matches:
-                return "Mogelijke overeenkomst(en)", "; ".join(matches[:5])
-            return "Geen resultaat", "Geen resultaten voor deze zoekterm; geen juridische garantie"
-        if res.status_code in (401, 403):
-            return "Niet gecontroleerd", "KVK API-sleutel of toegang ongeldig"
-        if res.status_code == 429:
-            return "Niet gecontroleerd", "KVK API-limiet bereikt"
-        return "Niet gecontroleerd", f"KVK HTTP {res.status_code}"
-    except (requests.RequestException, ValueError) as ex:
-        return "Niet gecontroleerd", f"KVK-fout: {type(ex).__name__}"
-
-
-def zoeklinks(naam: str) -> tuple[str, str]:
-    return (
-        "https://www.kvk.nl/starten/naamchecker/",
-        "https://www.boip.int/nl/merkenregister",
-    )
-
-
-def check_naam(naam: str, api_key: str, doe_kvk: bool) -> dict:
+def check_naam(naam, use_sidn, skip_found):
     domein = normaliseer_domein(naam)
-    d_status, d_toelichting = domein_check(domein)
-    k_status, k_toelichting = kvk_check(naam, api_key) if doe_kvk else ("Niet gecontroleerd", "KVK-controle uitgeschakeld")
-    kvk_link, boip_link = zoeklinks(naam)
+    web = website_check(domein)
+    skip = skip_found and web['Selectie'] == 'Afkeuren'
+    if use_sidn and not skip:
+        rdap_status, rdap_note = domein_check(domein)
+    else:
+        rdap_status, rdap_note = 'Overgeslagen', 'Uitgeschakeld of website gevonden'
+    if rdap_status == 'Geregistreerd':
+        web['Selectie'] = 'Afkeuren'
     return {
-        "Handelsnaam": naam,
-        "Domein": domein or "Ongeldig",
-        "Domeinstatus": d_status,
-        "Domeintoelichting": d_toelichting,
-        "KVK-status": k_status,
-        "KVK-resultaat": k_toelichting,
-        "KVK/BOIP Naamchecker": kvk_link,
-        "BOIP merkenregister": boip_link,
-        "SIDN controle": f"https://www.sidn.nl/" if not domein else "https://www.sidn.nl/",
+        'Handelsnaam': naam, 'Domein': domein or 'Ongeldig',
+        'Selectie': web['Selectie'], 'Website': web['Website'],
+        'Eind-URL': web['Eind-URL'], 'HTTP': web['HTTP'],
+        'IP-adres(sen)': web['IP-adres(sen)'],
+        'Website-opmerking': web['Website-opmerking'],
+        'SIDN-status': rdap_status, 'SIDN-opmerking': rdap_note,
+        'Handelsnaamindicatie': 'Niet automatisch gecontroleerd',
+        'Zoeklink Google': 'https://www.google.com/search?q=' + quote_plus('"'+naam+'"'),
+        'Zoeklink Bing': 'https://www.bing.com/search?q=' + quote_plus('"'+naam+'"'),
+        'Zoeklink DuckDuckGo': 'https://duckduckgo.com/?q=' + quote_plus('"'+naam+'"'),
+        'Zoeklink KVK': 'https://www.kvk.nl/zoeken/',
+        'KVK/BOIP Naamchecker': 'https://www.kvk.nl/starten/naamchecker/',
+        'BOIP merkenregister': 'https://www.boip.int/nl/merkenregister'
     }
 
-st.info("⚠️ 'Geen registratie gevonden' is niet hetzelfde als definitief registreerbaar. Een KVK-hit is evenmin automatisch een juridisch conflict. Controleer altijd spellingvarianten en merkenrechten.")
 
+st.info('**Let op:** geen website ≠ vrij domein ≠ vrije handelsnaam. De automatische controle onderzoekt DNS/HTTP en eventueel SIDN, **niet** bestaande handelsnamen of merken. Gebruik de zoeklinks en controleer de shortlist in de officiële registers.')
 with st.sidebar:
-    st.header("Instellingen")
-    try:
-        configured_key = st.secrets.get("KVK_API_KEY", "")
-    except (FileNotFoundError, KeyError):
-        configured_key = ""
-    if configured_key:
-        st.success("KVK API-sleutel ingesteld op de server")
-        api_key = configured_key
-    else:
-        api_key = st.text_input("KVK API-key (optioneel)", type="password", help="Voeg de sleutel bij voorkeur toe via Streamlit Cloud > Secrets. Niet rechtstreeks in broncode plaatsen.")
-    doe_kvk = st.checkbox("KVK via API controleren", value=False)
-    workers = st.slider("Parallelle domeinchecks", 1, 8, 3)
-    st.markdown("[KVK API aanvragen](https://developers.kvk.nl/)  ")
-    st.markdown("[Officiële KVK/BOIP Naamchecker](https://www.kvk.nl/starten/naamchecker/)  ")
-    st.markdown("[SIDN domeincheck](https://www.sidn.nl/)")
+    st.header('Instellingen (alles gratis)')
+    use_sidn = st.checkbox('Optioneel: SIDN RDAP-check voor overgebleven namen', value=False, help='Geen sleutel nodig; de openbare dienst kan verzoeken beperken (HTTP 429).')
+    skip_found = st.checkbox('Sla SIDN-check over bij gevonden website', value=True)
+    workers = st.slider('Gelijktijdige websitechecks', 1, 5, 2)
+    st.caption('Geen KVK-, Brave- of andere betaalde API nodig. Handelsnaam- en merkzoeklinks staan in het CSV-bestand. Zoekmachines worden niet automatisch gescrapet.')
 
-raw = st.text_area("Handelsnamen (één per regel)", height=230, placeholder="Wolkwerf\nHosthaven\nDomeinsteiger")
-st.caption("Voorbeeld: ‘Mijn Hosting’ wordt mijnhosting.nl. Alleen .nl wordt gecontroleerd.")
-upload = st.file_uploader("Of upload een CSV/TXT met één naam per regel", type=["csv", "txt"])
-
-if st.button("Controleer namen", type="primary"):
-    names = []
-    if raw.strip():
-        names.extend(x.strip() for x in raw.splitlines() if x.strip())
+raw = st.text_area('Handelsnamen (één per regel)', height=230, placeholder='DomeinKompas\nHostBaken\nWebHaven')
+upload = st.file_uploader('Of importeer CSV/TXT met naam in eerste kolom', type=['csv', 'txt'])
+if st.button('Controleer namen', type='primary'):
+    names = [x.strip() for x in raw.splitlines() if x.strip()]
     if upload is not None:
-        content = upload.getvalue().decode("utf-8-sig", errors="replace")
-        for row in csv.reader(io.StringIO(content)):
+        for row in csv.reader(io.StringIO(upload.getvalue().decode('utf-8-sig', errors='replace'))):
             if row and row[0].strip():
                 names.append(row[0].strip())
     names = list(dict.fromkeys(names))
     if not names:
-        st.warning("Voer minstens één naam in.")
+        st.warning('Voer minimaal één naam in.')
     elif len(names) > 200:
-        st.error("Maximaal 200 unieke namen per ronde, om onnodige API-belasting te voorkomen.")
+        st.error('Maximaal 200 namen per ronde.')
     else:
-        results = []
+        rows = []
         progress = st.progress(0)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(check_naam, n, api_key.strip(), doe_kvk): n for n in names}
-            for i, future in enumerate(as_completed(futures), 1):
+            jobs = {pool.submit(check_naam, n, use_sidn, skip_found): n for n in names}
+            for i, job in enumerate(as_completed(jobs), 1):
                 try:
-                    results.append(future.result())
-                except Exception as ex:
-                    results.append({"Handelsnaam": futures[future], "Domeinstatus": "Onbekend", "Domeintoelichting": type(ex).__name__})
+                    rows.append(job.result())
+                except Exception as e:
+                    rows.append({'Handelsnaam': jobs[job], 'Selectie': 'Nader onderzoeken', 'Website-opmerking': f'Onverwachte fout: {type(e).__name__}', 'Handelsnaamindicatie': 'Niet automatisch gecontroleerd'})
                 progress.progress(i / len(names))
         order = {n: i for i, n in enumerate(names)}
-        results.sort(key=lambda row: order[row["Handelsnaam"]])
-        df = pd.DataFrame(results)
-        st.subheader(f"Resultaten ({len(df)} namen)")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("Download resultaten als CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="handelsnaamchecker_resultaten.csv", mime="text/csv")
-        st.caption("Controleer namen met 'Geen registratie gevonden' bij een registrar voordat je registreert. Handelsnaam- en merkenonderzoek blijft noodzakelijk.")
+        rows.sort(key=lambda r: order[r['Handelsnaam']])
+        df = pd.DataFrame(rows)
+        st.session_state['results'] = df
+
+if 'results' in st.session_state:
+    df = st.session_state['results']
+    rejected = (df['Selectie'] == 'Afkeuren').sum()
+    st.subheader(f'Resultaten: {len(df)} namen · {rejected} afgevallen · {len(df) - rejected} nader te controleren')
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    remaining = df[df['Selectie'] != 'Afkeuren']
+    st.download_button('Download alle resultaten (CSV)', df.to_csv(index=False).encode('utf-8-sig'), 'websitechecker-alle-resultaten.csv', 'text/csv')
+    st.download_button('Download overgebleven namen (CSV)', remaining.to_csv(index=False).encode('utf-8-sig'), 'websitechecker-overgebleven.csv', 'text/csv')
+    st.caption('Namen die overblijven zijn kandidaten voor verdere controle, niet automatisch beschikbaar voor registratie.')
